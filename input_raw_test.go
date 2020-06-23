@@ -44,7 +44,7 @@ func TestRAWInputIPv4(t *testing.T) {
 
 	var respCounter, reqCounter int64
 
-	input := NewRAWInput(originAddr, EnginePcap, true, testRawExpire, "X-Real-IP", "", "", 0)
+	input := NewRAWInput(originAddr, EnginePcap, true, testRawExpire, "X-Real-IP", "http", "", "", 0)
 	defer input.Close()
 
 	output := NewTestOutput(func(data []byte) {
@@ -65,12 +65,16 @@ func TestRAWInputIPv4(t *testing.T) {
 		wg.Done()
 	})
 
-	Plugins.Inputs = []io.Reader{input}
-	Plugins.Outputs = []io.Writer{output}
+	plugins := &InOutPlugins{
+		Inputs:  []io.Reader{input},
+		Outputs: []io.Writer{output},
+	}
+	plugins.All = append(plugins.All, input, output)
 
 	client := NewHTTPClient("http://"+listener.Addr().String(), &HTTPClientConfig{})
 
-	go Start(quit)
+	emitter := NewEmitter(quit)
+	go emitter.Start(plugins, Settings.middleware)
 
 	for i := 0; i < 100; i++ {
 		// request + response
@@ -80,8 +84,7 @@ func TestRAWInputIPv4(t *testing.T) {
 	}
 
 	wg.Wait()
-
-	close(quit)
+	emitter.Close()
 }
 
 func TestRAWInputNoKeepAlive(t *testing.T) {
@@ -106,19 +109,23 @@ func TestRAWInputNoKeepAlive(t *testing.T) {
 
 	originAddr := listener.Addr().String()
 
-	input := NewRAWInput(originAddr, EnginePcap, true, testRawExpire, "", "", "", 0)
+	input := NewRAWInput(originAddr, EnginePcap, true, testRawExpire, "", "http", "", "", 0)
 	defer input.Close()
 
 	output := NewTestOutput(func(data []byte) {
 		wg.Done()
 	})
 
-	Plugins.Inputs = []io.Reader{input}
-	Plugins.Outputs = []io.Writer{output}
+	plugins := &InOutPlugins{
+		Inputs:  []io.Reader{input},
+		Outputs: []io.Writer{output},
+	}
+	plugins.All = append(plugins.All, input, output)
 
 	client := NewHTTPClient("http://"+listener.Addr().String(), &HTTPClientConfig{})
 
-	go Start(quit)
+	emitter := NewEmitter(quit)
+	go emitter.Start(plugins, Settings.middleware)
 
 	for i := 0; i < 100; i++ {
 		// request + response
@@ -128,8 +135,7 @@ func TestRAWInputNoKeepAlive(t *testing.T) {
 	}
 
 	wg.Wait()
-
-	close(quit)
+	emitter.Close()
 }
 
 func TestRAWInputIPv6(t *testing.T) {
@@ -152,7 +158,7 @@ func TestRAWInputIPv6(t *testing.T) {
 
 	var respCounter, reqCounter int64
 
-	input := NewRAWInput(originAddr, EnginePcap, true, testRawExpire, "", "", "", 0)
+	input := NewRAWInput(originAddr, EnginePcap, true, testRawExpire, "", "http", "", "", 0)
 	defer input.Close()
 
 	output := NewTestOutput(func(data []byte) {
@@ -169,12 +175,16 @@ func TestRAWInputIPv6(t *testing.T) {
 		wg.Done()
 	})
 
-	Plugins.Inputs = []io.Reader{input}
-	Plugins.Outputs = []io.Writer{output}
+	plugins := &InOutPlugins{
+		Inputs:  []io.Reader{input},
+		Outputs: []io.Writer{output},
+	}
+	plugins.All = append(plugins.All, input, output)
 
 	client := NewHTTPClient("http://"+listener.Addr().String(), &HTTPClientConfig{})
 
-	go Start(quit)
+	emitter := NewEmitter(quit)
+	go emitter.Start(plugins, Settings.middleware)
 
 	for i := 0; i < 100; i++ {
 		// request + response
@@ -184,7 +194,7 @@ func TestRAWInputIPv6(t *testing.T) {
 	}
 
 	wg.Wait()
-	close(quit)
+	emitter.Close()
 }
 
 func TestInputRAW100Expect(t *testing.T) {
@@ -203,7 +213,7 @@ func TestInputRAW100Expect(t *testing.T) {
 
 	originAddr := strings.Replace(origin.Listener.Addr().String(), "[::]", "127.0.0.1", -1)
 
-	input := NewRAWInput(originAddr, EnginePcap, true, time.Second, "", "", "", 0)
+	input := NewRAWInput(originAddr, EnginePcap, true, time.Second, "", "http", "", "", 0)
 	defer input.Close()
 
 	// We will use it to get content of raw HTTP request
@@ -234,10 +244,14 @@ func TestInputRAW100Expect(t *testing.T) {
 
 	httpOutput := NewHTTPOutput(replay.URL, &HTTPOutputConfig{})
 
-	Plugins.Inputs = []io.Reader{input}
-	Plugins.Outputs = []io.Writer{testOutput, httpOutput}
+	plugins := &InOutPlugins{
+		Inputs:  []io.Reader{input},
+		Outputs: []io.Writer{testOutput, httpOutput},
+	}
+	plugins.All = append(plugins.All, input, testOutput, httpOutput)
 
-	go Start(quit)
+	emitter := NewEmitter(quit)
+	go emitter.Start(plugins, Settings.middleware)
 
 	// Origin + Response/Request Test Output + Request Http Output
 	wg.Add(4)
@@ -248,7 +262,7 @@ func TestInputRAW100Expect(t *testing.T) {
 	}
 
 	wg.Wait()
-	close(quit)
+	emitter.Close()
 }
 
 func TestInputRAWChunkedEncoding(t *testing.T) {
@@ -266,7 +280,7 @@ func TestInputRAWChunkedEncoding(t *testing.T) {
 	}))
 
 	originAddr := strings.Replace(origin.Listener.Addr().String(), "[::]", "127.0.0.1", -1)
-	input := NewRAWInput(originAddr, EnginePcap, true, time.Second, "", "", "", 0)
+	input := NewRAWInput(originAddr, EnginePcap, true, time.Second, "", "http", "", "", 0)
 	defer input.Close()
 
 	replay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -284,11 +298,14 @@ func TestInputRAWChunkedEncoding(t *testing.T) {
 
 	httpOutput := NewHTTPOutput(replay.URL, &HTTPOutputConfig{Debug: true})
 
-	Plugins.Inputs = []io.Reader{input}
-	Plugins.Outputs = []io.Writer{httpOutput}
+	plugins := &InOutPlugins{
+		Inputs:  []io.Reader{input},
+		Outputs: []io.Writer{httpOutput},
+	}
+	plugins.All = append(plugins.All, input, httpOutput)
 
-	go Start(quit)
-
+	emitter := NewEmitter(quit)
+	go emitter.Start(plugins, Settings.middleware)
 	wg.Add(2)
 
 	curl := exec.Command("curl", "http://"+originAddr, "--header", "Transfer-Encoding: chunked", "--header", "Expect:", "--data-binary", "@README.md")
@@ -298,8 +315,7 @@ func TestInputRAWChunkedEncoding(t *testing.T) {
 	}
 
 	wg.Wait()
-
-	close(quit)
+	emitter.Close()
 }
 
 func TestInputRAWLargePayload(t *testing.T) {
@@ -330,7 +346,7 @@ func TestInputRAWLargePayload(t *testing.T) {
 	}))
 	originAddr := strings.Replace(origin.Listener.Addr().String(), "[::]", "127.0.0.1", -1)
 
-	input := NewRAWInput(originAddr, EnginePcap, true, testRawExpire, "", "", "", 0)
+	input := NewRAWInput(originAddr, EnginePcap, true, testRawExpire, "", "http", "", "", 0)
 	defer input.Close()
 
 	replay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -350,10 +366,14 @@ func TestInputRAWLargePayload(t *testing.T) {
 
 	httpOutput := NewHTTPOutput(replay.URL, &HTTPOutputConfig{Debug: false})
 
-	Plugins.Inputs = []io.Reader{input}
-	Plugins.Outputs = []io.Writer{httpOutput}
+	plugins := &InOutPlugins{
+		Inputs:  []io.Reader{input},
+		Outputs: []io.Writer{httpOutput},
+	}
+	plugins.All = append(plugins.All, input, httpOutput)
 
-	go Start(quit)
+	emitter := NewEmitter(quit)
+	go emitter.Start(plugins, Settings.middleware)
 
 	wg.Add(2)
 	curl := exec.Command("curl", "http://"+originAddr, "--header", "Transfer-Encoding: chunked", "--header", "Expect:", "--data-binary", "@/tmp/large")
@@ -363,7 +383,7 @@ func TestInputRAWLargePayload(t *testing.T) {
 	}
 
 	wg.Wait()
-	close(quit)
+	emitter.Close()
 }
 
 func BenchmarkRAWInput(b *testing.B) {
@@ -381,7 +401,7 @@ func BenchmarkRAWInput(b *testing.B) {
 	defer origin.Close()
 	upstreamAddr := strings.Replace(upstream.Listener.Addr().String(), "[::]", "127.0.0.1", -1)
 
-	input := NewRAWInput(originAddr, EnginePcap, true, testRawExpire, "", "", "", 0)
+	input := NewRAWInput(originAddr, EnginePcap, true, testRawExpire, "", "http", "", "", 0)
 	defer input.Close()
 
 	output := NewTestOutput(func(data []byte) {
@@ -394,10 +414,14 @@ func BenchmarkRAWInput(b *testing.B) {
 
 	httpOutput := NewLimiter(NewHTTPOutput(upstreamAddr, &HTTPOutputConfig{}), "10%")
 
-	Plugins.Inputs = []io.Reader{input}
-	Plugins.Outputs = []io.Writer{output, httpOutput}
+	plugins := &InOutPlugins{
+		Inputs:  []io.Reader{input},
+		Outputs: []io.Writer{output, httpOutput},
+	}
+	plugins.All = append(plugins.All, input, output, httpOutput)
 
-	go Start(quit)
+	emitter := NewEmitter(quit)
+	go emitter.Start(plugins, Settings.middleware)
 
 	emitted := 0
 	fileContent, _ := ioutil.ReadFile("LICENSE.txt")
@@ -428,5 +452,5 @@ func BenchmarkRAWInput(b *testing.B) {
 	time.Sleep(400 * time.Millisecond)
 	log.Println("Emitted ", emitted, ", Captured ", reqCounter, "requests and ", respCounter, " responses", "and replayed", replayCounter)
 
-	close(quit)
+	emitter.Close()
 }

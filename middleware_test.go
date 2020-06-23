@@ -118,17 +118,21 @@ func TestEchoMiddleware(t *testing.T) {
 
 	// Catch traffic from one service
 	fromAddr := strings.Replace(from.Listener.Addr().String(), "[::]", "127.0.0.1", -1)
-	input := NewRAWInput(fromAddr, EnginePcap, true, testRawExpire, "", "", "", 0)
+	input := NewRAWInput(fromAddr, EnginePcap, true, testRawExpire, "", "http", "", "", 0)
 	defer input.Close()
 
 	// And redirect to another
 	output := NewHTTPOutput(to.URL, &HTTPOutputConfig{Debug: false})
 
-	Plugins.Inputs = []io.Reader{input}
-	Plugins.Outputs = []io.Writer{output}
+	plugins := &InOutPlugins{
+		Inputs:  []io.Reader{input},
+		Outputs: []io.Writer{output},
+	}
+	plugins.All = append(plugins.All, input, output)
 
 	// Start Gor
-	go Start(quit)
+	emitter := NewEmitter(quit)
+	go emitter.Start(plugins, Settings.middleware)
 
 	// Wait till middleware initialization
 	time.Sleep(100 * time.Millisecond)
@@ -146,7 +150,7 @@ func TestEchoMiddleware(t *testing.T) {
 	}
 
 	wg.Wait()
-	close(quit)
+	emitter.Close()
 	time.Sleep(200 * time.Millisecond)
 
 	Settings.middleware = ""
@@ -180,17 +184,21 @@ func TestTokenMiddleware(t *testing.T) {
 
 	fromAddr := strings.Replace(from.Listener.Addr().String(), "[::]", "127.0.0.1", -1)
 	// Catch traffic from one service
-	input := NewRAWInput(fromAddr, EnginePcap, true, testRawExpire, "", "", "", 0)
+	input := NewRAWInput(fromAddr, EnginePcap, true, testRawExpire, "", "http", "", "", 0)
 	defer input.Close()
 
 	// And redirect to another
 	output := NewHTTPOutput(to.URL, &HTTPOutputConfig{Debug: true})
 
-	Plugins.Inputs = []io.Reader{input}
-	Plugins.Outputs = []io.Writer{output}
+	plugins := &InOutPlugins{
+		Inputs:  []io.Reader{input},
+		Outputs: []io.Writer{output},
+	}
+	plugins.All = append(plugins.All, input, output)
 
 	// Start Gor
-	go Start(quit)
+	emitter := NewEmitter(quit)
+	go emitter.Start(plugins, Settings.middleware)
 
 	// Wait for middleware to initialize
 	// Give go compiller time to build programm
@@ -215,7 +223,7 @@ func TestTokenMiddleware(t *testing.T) {
 	}
 
 	wg.Wait()
-	close(quit)
+	emitter.Close()
 	time.Sleep(100 * time.Millisecond)
 	Settings.middleware = ""
 }

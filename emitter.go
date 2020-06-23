@@ -2,49 +2,80 @@ package main
 
 import (
 	"bytes"
+	"hash/fnv"
 	"io"
 	"log"
+	"sync"
 	"time"
 )
 
-// Start initialize loop for sending data from inputs to outputs
-func Start(stop chan int) {
-	if Settings.middleware != "" {
-		middleware := NewMiddleware(Settings.middleware)
+type emitter struct {
+	sync.WaitGroup
+	quit chan int
+}
 
-		for _, in := range Plugins.Inputs {
+// NewEmitter creates and initializes new `emitter` object.
+func NewEmitter(quit chan int) *emitter {
+	return &emitter{
+		quit: quit,
+	}
+}
+
+// Start initialize loop for sending data from inputs to outputs
+func (e *emitter) Start(plugins *InOutPlugins, middlewareCmd string) {
+	e.Add(1)
+	defer e.Done()
+
+	if middlewareCmd != "" {
+		middleware := NewMiddleware(middlewareCmd)
+
+		for _, in := range plugins.Inputs {
 			middleware.ReadFrom(in)
 		}
 
 		// We are going only to read responses, so using same ReadFrom method
-		for _, out := range Plugins.Outputs {
+		for _, out := range plugins.Outputs {
 			if r, ok := out.(io.Reader); ok {
 				middleware.ReadFrom(r)
 			}
 		}
-
+		e.Add(1)
 		go func() {
-			if err := CopyMulty(middleware, Plugins.Outputs...); err != nil {
+			defer e.Done()
+			if err := CopyMulty(e.quit, middleware, plugins.Outputs...); err != nil {
 				log.Println("Error during copy: ", err)
-				close(stop)
+				e.close()
+			}
+		}()
+		go func() {
+			for {
+				select {
+				case <-e.quit:
+					middleware.Close()
+					return
+				}
 			}
 		}()
 	} else {
-		for _, in := range Plugins.Inputs {
+		for _, in := range plugins.Inputs {
+			e.Add(1)
 			go func(in io.Reader) {
-				if err := CopyMulty(in, Plugins.Outputs...); err != nil {
+				defer e.Done()
+				if err := CopyMulty(e.quit, in, plugins.Outputs...); err != nil {
 					log.Println("Error during copy: ", err)
-					close(stop)
+					e.close()
 				}
 			}(in)
 		}
 
-		for _, out := range Plugins.Outputs {
+		for _, out := range plugins.Outputs {
 			if r, ok := out.(io.Reader); ok {
+				e.Add(1)
 				go func(r io.Reader) {
-					if err := CopyMulty(r, Plugins.Outputs...); err != nil {
+					defer e.Done()
+					if err := CopyMulty(e.quit, r, plugins.Outputs...); err != nil {
 						log.Println("Error during copy: ", err)
-						close(stop)
+						e.close()
 					}
 				}(r)
 			}
@@ -53,16 +84,30 @@ func Start(stop chan int) {
 
 	for {
 		select {
-		case <-stop:
-			finalize()
+		case <-e.quit:
+			finalize(plugins)
 			return
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
 }
 
+func (e *emitter) close() {
+	select {
+	case <-e.quit:
+	default:
+		close(e.quit)
+	}
+}
+
+// Close closes all the goroutine and waits for it to finish.
+func (e *emitter) Close() {
+	e.close()
+	e.Wait()
+}
+
 // CopyMulty copies from 1 reader to multiple writers
-func CopyMulty(src io.Reader, writers ...io.Writer) (err error) {
+func CopyMulty(stop chan int, src io.Reader, writers ...io.Writer) error {
 	buf := make([]byte, Settings.copyBufferSize)
 	wIndex := 0
 	modifier := NewHTTPModifier(&Settings.modifierConfig)
@@ -70,14 +115,20 @@ func CopyMulty(src io.Reader, writers ...io.Writer) (err error) {
 	filteredRequestsLastCleanTime := time.Now()
 
 	i := 0
-
 	for {
-		nr, er := src.Read(buf)
+		var nr int
+		nr, err := src.Read(buf)
 
-		if er == io.EOF {
+		select {
+		case <-stop:
+			return nil
+		default:
+		}
+
+		if err == io.EOF || err == ErrorStopped {
 			return nil
 		}
-		if er != nil {
+		if err != nil {
 			return err
 		}
 
@@ -140,15 +191,28 @@ func CopyMulty(src io.Reader, writers ...io.Writer) (err error) {
 			}
 
 			if Settings.splitOutput {
-				// Simple round robin
-				if _, err := writers[wIndex].Write(payload); err != nil {
-					return err
-				}
+				if Settings.recognizeTCPSessions {
+					if !PRO {
+						log.Fatal("Detailed TCP sessions work only with PRO license")
+					}
+					hasher := fnv.New32a()
+					// First 20 bytes contain tcp session
+					id := payloadID(payload)
+					hasher.Write(id[:20])
 
-				wIndex++
+					wIndex = int(hasher.Sum32()) % len(writers)
+					writers[wIndex].Write(payload)
+				} else {
+					// Simple round robin
+					if _, err := writers[wIndex].Write(payload); err != nil {
+						return err
+					}
 
-				if wIndex >= len(writers) {
-					wIndex = 0
+					wIndex++
+
+					if wIndex >= len(writers) {
+						wIndex = 0
+					}
 				}
 			} else {
 				for _, dst := range writers {
@@ -177,6 +241,4 @@ func CopyMulty(src io.Reader, writers ...io.Writer) (err error) {
 
 		i++
 	}
-
-	return err
 }

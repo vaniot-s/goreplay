@@ -12,14 +12,21 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/s3"
 )
 
 type fileInputReader struct {
 	reader    *bufio.Reader
 	data      []byte
-	file      *os.File
+	file      io.ReadCloser
 	timestamp int64
+	closed    int32 // Value of 0 indicates that the file is still open.
+	s3        bool
 }
 
 func (f *fileInputReader) parseNext() error {
@@ -36,8 +43,7 @@ func (f *fileInputReader) parseNext() error {
 			}
 
 			if err == io.EOF {
-				f.file.Close()
-				f.file = nil
+				f.Close()
 				return err
 			}
 		}
@@ -64,7 +70,8 @@ func (f *fileInputReader) ReadPayload() []byte {
 	return f.data
 }
 func (f *fileInputReader) Close() error {
-	if f.file != nil {
+	if atomic.LoadInt32(&f.closed) == 0 {
+		atomic.StoreInt32(&f.closed, 1)
 		f.file.Close()
 	}
 
@@ -72,14 +79,21 @@ func (f *fileInputReader) Close() error {
 }
 
 func NewFileInputReader(path string) *fileInputReader {
-	file, err := os.Open(path)
+	var file io.ReadCloser
+	var err error
+
+	if strings.HasPrefix(path, "s3://") {
+		file = NewS3ReadCloser(path)
+	} else {
+		file, err = os.Open(path)
+	}
 
 	if err != nil {
 		log.Println(err)
 		return nil
 	}
 
-	r := &fileInputReader{file: file}
+	r := &fileInputReader{file: file, closed: 0}
 	if strings.HasSuffix(path, ".gz") {
 		gzReader, err := gzip.NewReader(file)
 		if err != nil {
@@ -111,7 +125,7 @@ type FileInput struct {
 func NewFileInput(path string, loop bool) (i *FileInput) {
 	i = new(FileInput)
 	i.data = make(chan []byte, 1000)
-	i.exit = make(chan bool, 1)
+	i.exit = make(chan bool)
 	i.path = path
 	i.speedFactor = 1
 	i.loop = loop
@@ -125,21 +139,37 @@ func NewFileInput(path string, loop bool) (i *FileInput) {
 	return
 }
 
-type NextFileNotFound struct{}
-
-func (_ *NextFileNotFound) Error() string {
-	return "There is no new files"
-}
-
 func (i *FileInput) init() (err error) {
 	defer i.mu.Unlock()
 	i.mu.Lock()
 
 	var matches []string
 
-	if matches, err = filepath.Glob(i.path); err != nil {
-		log.Println("Wrong file pattern", i.path, err)
-		return
+	if strings.HasPrefix(i.path, "s3://") {
+		sess := session.Must(session.NewSession(awsConfig()))
+		svc := s3.New(sess)
+
+		bucket, key := parseS3Url(i.path)
+
+		params := &s3.ListObjectsInput{
+			Bucket: aws.String(bucket),
+			Prefix: aws.String(key),
+		}
+
+		resp, err := svc.ListObjects(params)
+		if err != nil {
+			log.Println("Error while retreiving list of files from S3", i.path, err)
+			return err
+		}
+
+		for _, c := range resp.Contents {
+			matches = append(matches, "s3://"+bucket+"/"+(*c.Key))
+		}
+	} else {
+		if matches, err = filepath.Glob(i.path); err != nil {
+			log.Println("Wrong file pattern", i.path, err)
+			return
+		}
 	}
 
 	if len(matches) == 0 {
@@ -157,9 +187,13 @@ func (i *FileInput) init() (err error) {
 }
 
 func (i *FileInput) Read(data []byte) (int, error) {
-	buf := <-i.data
+	var buf []byte
+	select {
+	case <-i.exit:
+		return 0, ErrorStopped
+	case buf = <-i.data:
+	}
 	copy(data, buf)
-
 	return len(buf), nil
 }
 
@@ -170,7 +204,7 @@ func (i *FileInput) String() string {
 // Find reader with smallest timestamp e.g next payload in row
 func (i *FileInput) nextReader() (next *fileInputReader) {
 	for _, r := range i.readers {
-		if r == nil || r.file == nil {
+		if r == nil || atomic.LoadInt32(&r.closed) != 0 {
 			continue
 		}
 
@@ -218,7 +252,13 @@ func (i *FileInput) emit() {
 			lastTime = reader.timestamp
 		}
 
-		i.data <- reader.ReadPayload()
+		// Recheck if we have exited since last check.
+		select {
+		case <-i.exit:
+			return
+		default:
+			i.data <- reader.ReadPayload()
+		}
 	}
 
 	log.Printf("FileInput: end of file '%s'\n", i.path)
@@ -235,8 +275,7 @@ func (i *FileInput) Close() error {
 	defer i.mu.Unlock()
 	i.mu.Lock()
 
-	i.exit <- true
-
+	close(i.exit)
 	for _, r := range i.readers {
 		r.Close()
 	}
